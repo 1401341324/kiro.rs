@@ -109,26 +109,6 @@ impl ToolResult {
             is_error: true,
         }
     }
-
-    /// 用任意 content blocks 数组创建（实验：保留 image 嵌套结构发给上游）
-    ///
-    /// 用途：测试 AWS Kiro API 是否真的不支持 tool_result.content[] 嵌套 image。
-    /// 直接传入预构造好的 content map 数组（每个 map 形如 {"text": "..."} 或
-    /// {"image": {"format": "png", "source": {"bytes": "..."}}}）。
-    ///
-    /// 调用方负责保证 map 结构与 Kiro API 期望一致。
-    pub fn with_blocks(
-        tool_use_id: impl Into<String>,
-        content: Vec<serde_json::Map<String, serde_json::Value>>,
-        is_error: bool,
-    ) -> Self {
-        Self {
-            tool_use_id: tool_use_id.into(),
-            content,
-            status: Some(if is_error { "error" } else { "success" }.to_string()),
-            is_error,
-        }
-    }
 }
 
 /// 工具使用条目
