@@ -369,35 +369,14 @@ fn process_message_content(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let (result_text, result_images) =
+                                let content_blocks =
                                     extract_tool_result_content(&block.content);
                                 let is_error = block.is_error.unwrap_or(false);
 
-                                // 把 tool_result 里嵌套的 image 提升到顶层 user message
-                                // （AWS Kiro API 的 ToolResult.content 不支持 image 类型）
-                                let image_count = result_images.len();
-                                let augmented_text = if image_count == 0 {
-                                    result_text
-                                } else {
-                                    // 把 image 提升到顶层
-                                    images.extend(result_images);
-                                    // 给文本里加占位符提示模型"上面那些图是 tool 返回的"
-                                    let hint = format!(
-                                        "[Tool returned {} image(s); shown as user-attached images above]",
-                                        image_count
-                                    );
-                                    if result_text.is_empty() {
-                                        hint
-                                    } else {
-                                        format!("{}\n{}", result_text, hint)
-                                    }
-                                };
-
-                                let mut result = if is_error {
-                                    ToolResult::error(&tool_use_id, augmented_text)
-                                } else {
-                                    ToolResult::success(&tool_use_id, augmented_text)
-                                };
+                                // 实验：保留 image 嵌套结构发给 Kiro 上游
+                                // 测试 AWS Kiro API 是否真的不支持 tool_result.content[].image
+                                let mut result =
+                                    ToolResult::with_blocks(&tool_use_id, content_blocks, is_error);
                                 result.status =
                                     Some(if is_error { "error" } else { "success" }.to_string());
 
@@ -431,27 +410,27 @@ fn get_image_format(media_type: &str) -> Option<String> {
 
 /// 提取工具结果内容
 ///
-/// 返回 (text, images)：
-/// - text: tool_result 中的文本部分（拼接）
-/// - images: tool_result 中的 image block（提取出来，调用方负责把这些 image 提升到顶层）
+/// 返回 content blocks 数组，每个 block 是一个 Map：
+/// - text block: `{"text": "..."}`
+/// - image block: `{"image": {"format": "...", "source": {"bytes": "..."}}}`
 ///
-/// 背景：Anthropic 协议允许 tool_result.content[] 包含 image block（vision in tool use），
-/// 但 AWS Kiro API 的 ToolResult.content 字段只支持 text 类型（kiro/model/requests/tool.rs
-/// 里 ToolResult::success 签名只接受 String）。
+/// 实验目的：保留 image 嵌套结构发给 AWS Kiro 上游，验证 Kiro API 是否真的支持
+/// tool_result.content[] 嵌套 image。如果上游报错或丢弃 image，再退回到"提升到顶层"
+/// 的变通方案。
 ///
-/// 为了让客户端的 image-in-tool_result 场景能正常识图（例如 Claude Code CLI 的 Read 工具
-/// 返回 PNG），我们在协议转换时把 tool_result 里的 image 提取出来，由调用方把它们提升到
-/// 顶层 user message 的 images 列表里。这牺牲了"这张图是 tool 返回的"语义，但保证了
-/// 模型至少能看到图。
+/// Kiro API 的 ToolResult.content 字段类型是 Vec<serde_json::Map<String, Value>>，
+/// 通用 JSON Map 结构，理论上可以塞任何 block。
 fn extract_tool_result_content(
     content: &Option<serde_json::Value>,
-) -> (String, Vec<KiroImage>) {
-    let mut text_parts = Vec::new();
-    let mut images = Vec::new();
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let mut blocks = Vec::new();
 
     match content {
         Some(serde_json::Value::String(s)) => {
-            text_parts.push(s.clone());
+            // 字符串直接当 text block
+            let mut map = serde_json::Map::new();
+            map.insert("text".to_string(), serde_json::Value::String(s.clone()));
+            blocks.push(map);
         }
         Some(serde_json::Value::Array(arr)) => {
             for item in arr {
@@ -459,30 +438,58 @@ fn extract_tool_result_content(
                 match block_type {
                     "text" => {
                         if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                            text_parts.push(text.to_string());
+                            let mut map = serde_json::Map::new();
+                            map.insert(
+                                "text".to_string(),
+                                serde_json::Value::String(text.to_string()),
+                            );
+                            blocks.push(map);
                         }
                     }
                     "image" => {
-                        // 把 image 提取出来，提升到顶层
+                        // 保留 image 嵌套结构，按 KiroImage 序列化格式构造
+                        // 上游收到 {"image": {"format": "png", "source": {"bytes": "..."}}}
                         if let Some(source) = item.get("source") {
                             if let (Some(media_type), Some(data)) = (
                                 source.get("media_type").and_then(|v| v.as_str()),
                                 source.get("data").and_then(|v| v.as_str()),
                             ) {
                                 if let Some(format) = get_image_format(media_type) {
-                                    images.push(KiroImage::from_base64(
-                                        format,
-                                        data.to_string(),
-                                    ));
+                                    let mut image_map = serde_json::Map::new();
+                                    image_map.insert(
+                                        "format".to_string(),
+                                        serde_json::Value::String(format),
+                                    );
+                                    let mut source_map = serde_json::Map::new();
+                                    source_map.insert(
+                                        "bytes".to_string(),
+                                        serde_json::Value::String(data.to_string()),
+                                    );
+                                    image_map.insert(
+                                        "source".to_string(),
+                                        serde_json::Value::Object(source_map),
+                                    );
+
+                                    let mut block_map = serde_json::Map::new();
+                                    block_map.insert(
+                                        "image".to_string(),
+                                        serde_json::Value::Object(image_map),
+                                    );
+                                    blocks.push(block_map);
                                 }
                             }
                         }
                     }
                     _ => {
-                        // 兼容老格式：如果 item 直接有 text 字段（没有 type），也提取
+                        // 未知类型：兼容老格式（item 直接有 text 字段没有 type）
                         if block_type.is_empty() {
                             if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                                text_parts.push(text.to_string());
+                                let mut map = serde_json::Map::new();
+                                map.insert(
+                                    "text".to_string(),
+                                    serde_json::Value::String(text.to_string()),
+                                );
+                                blocks.push(map);
                             }
                         }
                     }
@@ -490,12 +497,22 @@ fn extract_tool_result_content(
             }
         }
         Some(v) => {
-            text_parts.push(v.to_string());
+            // 兜底：把任何其他 JSON 值字符串化当 text block
+            let mut map = serde_json::Map::new();
+            map.insert("text".to_string(), serde_json::Value::String(v.to_string()));
+            blocks.push(map);
         }
         None => {}
     }
 
-    (text_parts.join("\n"), images)
+    // Kiro API 不接受空 content 数组，至少塞一个空 text 占位
+    if blocks.is_empty() {
+        let mut map = serde_json::Map::new();
+        map.insert("text".to_string(), serde_json::Value::String(String::new()));
+        blocks.push(map);
+    }
+
+    blocks
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
