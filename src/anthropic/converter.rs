@@ -369,13 +369,34 @@ fn process_message_content(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
+                                let (result_text, result_images) =
+                                    extract_tool_result_content(&block.content);
                                 let is_error = block.is_error.unwrap_or(false);
 
-                                let mut result = if is_error {
-                                    ToolResult::error(&tool_use_id, result_content)
+                                // 把 tool_result 里嵌套的 image 提升到顶层 user message
+                                // （AWS Kiro API 的 ToolResult.content 不支持 image 类型）
+                                let image_count = result_images.len();
+                                let augmented_text = if image_count == 0 {
+                                    result_text
                                 } else {
-                                    ToolResult::success(&tool_use_id, result_content)
+                                    // 把 image 提升到顶层
+                                    images.extend(result_images);
+                                    // 给文本里加占位符提示模型"上面那些图是 tool 返回的"
+                                    let hint = format!(
+                                        "[Tool returned {} image(s); shown as user-attached images above]",
+                                        image_count
+                                    );
+                                    if result_text.is_empty() {
+                                        hint
+                                    } else {
+                                        format!("{}\n{}", result_text, hint)
+                                    }
+                                };
+
+                                let mut result = if is_error {
+                                    ToolResult::error(&tool_use_id, augmented_text)
+                                } else {
+                                    ToolResult::success(&tool_use_id, augmented_text)
                                 };
                                 result.status =
                                     Some(if is_error { "error" } else { "success" }.to_string());
@@ -409,21 +430,72 @@ fn get_image_format(media_type: &str) -> Option<String> {
 }
 
 /// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
+///
+/// 返回 (text, images)：
+/// - text: tool_result 中的文本部分（拼接）
+/// - images: tool_result 中的 image block（提取出来，调用方负责把这些 image 提升到顶层）
+///
+/// 背景：Anthropic 协议允许 tool_result.content[] 包含 image block（vision in tool use），
+/// 但 AWS Kiro API 的 ToolResult.content 字段只支持 text 类型（kiro/model/requests/tool.rs
+/// 里 ToolResult::success 签名只接受 String）。
+///
+/// 为了让客户端的 image-in-tool_result 场景能正常识图（例如 Claude Code CLI 的 Read 工具
+/// 返回 PNG），我们在协议转换时把 tool_result 里的 image 提取出来，由调用方把它们提升到
+/// 顶层 user message 的 images 列表里。这牺牲了"这张图是 tool 返回的"语义，但保证了
+/// 模型至少能看到图。
+fn extract_tool_result_content(
+    content: &Option<serde_json::Value>,
+) -> (String, Vec<KiroImage>) {
+    let mut text_parts = Vec::new();
+    let mut images = Vec::new();
+
     match content {
-        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::String(s)) => {
+            text_parts.push(s.clone());
+        }
         Some(serde_json::Value::Array(arr)) => {
-            let mut parts = Vec::new();
             for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    parts.push(text.to_string());
+                let block_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match block_type {
+                    "text" => {
+                        if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                            text_parts.push(text.to_string());
+                        }
+                    }
+                    "image" => {
+                        // 把 image 提取出来，提升到顶层
+                        if let Some(source) = item.get("source") {
+                            if let (Some(media_type), Some(data)) = (
+                                source.get("media_type").and_then(|v| v.as_str()),
+                                source.get("data").and_then(|v| v.as_str()),
+                            ) {
+                                if let Some(format) = get_image_format(media_type) {
+                                    images.push(KiroImage::from_base64(
+                                        format,
+                                        data.to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // 兼容老格式：如果 item 直接有 text 字段（没有 type），也提取
+                        if block_type.is_empty() {
+                            if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                                text_parts.push(text.to_string());
+                            }
+                        }
+                    }
                 }
             }
-            parts.join("\n")
         }
-        Some(v) => v.to_string(),
-        None => String::new(),
+        Some(v) => {
+            text_parts.push(v.to_string());
+        }
+        None => {}
     }
+
+    (text_parts.join("\n"), images)
 }
 
 /// 验证并过滤 tool_use/tool_result 配对
