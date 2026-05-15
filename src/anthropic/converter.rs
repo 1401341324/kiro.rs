@@ -353,7 +353,23 @@ fn process_message_content(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
+                let block = match serde_json::from_value::<ContentBlock>(item.clone()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // 反序列化失败：image source 字段不全等情况会触发，必须打 warn
+                        let block_type = item.get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        tracing::warn!(
+                            "ContentBlock 反序列化失败，整个 block 被丢弃: type={} err={} item_keys={:?}",
+                            block_type,
+                            e,
+                            item.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                        );
+                        continue;
+                    }
+                };
+                {
                     match block.block_type.as_str() {
                         "text" => {
                             if let Some(text) = block.text {
@@ -361,9 +377,29 @@ fn process_message_content(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
+                            match block.source {
+                                Some(source) => {
+                                    match get_image_format(&source.media_type) {
+                                        Some(format) => {
+                                            images.push(KiroImage::from_base64(format, source.data));
+                                            tracing::debug!(
+                                                "top-level image extracted: media_type={}",
+                                                source.media_type
+                                            );
+                                        }
+                                        None => {
+                                            tracing::warn!(
+                                                "top-level image 不支持的 media_type={}, 整张图被丢",
+                                                source.media_type
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        "top-level image block 没有 source 字段，被丢: {:?}",
+                                        item
+                                    );
                                 }
                             }
                         }
@@ -464,17 +500,47 @@ fn extract_tool_result_content(
                     }
                     "image" => {
                         // 把 image 提取出来，提升到顶层
-                        if let Some(source) = item.get("source") {
-                            if let (Some(media_type), Some(data)) = (
-                                source.get("media_type").and_then(|v| v.as_str()),
-                                source.get("data").and_then(|v| v.as_str()),
-                            ) {
-                                if let Some(format) = get_image_format(media_type) {
-                                    images.push(KiroImage::from_base64(
-                                        format,
-                                        data.to_string(),
-                                    ));
+                        // 任何 silent skip 都要打 warn，方便排查"偶发识别不到"
+                        let source = match item.get("source") {
+                            Some(s) => s,
+                            None => {
+                                tracing::warn!(
+                                    "tool_result image block 缺少 source 字段，跳过: {:?}",
+                                    item
+                                );
+                                continue;
+                            }
+                        };
+                        let media_type = source.get("media_type").and_then(|v| v.as_str());
+                        let data = source.get("data").and_then(|v| v.as_str());
+                        match (media_type, data) {
+                            (Some(mt), Some(d)) => {
+                                match get_image_format(mt) {
+                                    Some(format) => {
+                                        images.push(KiroImage::from_base64(
+                                            format,
+                                            d.to_string(),
+                                        ));
+                                        tracing::debug!(
+                                            "tool_result image extracted: media_type={} size={}b",
+                                            mt,
+                                            d.len()
+                                        );
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            "tool_result image: 不支持的 media_type={}, 跳过",
+                                            mt
+                                        );
+                                    }
                                 }
+                            }
+                            _ => {
+                                tracing::warn!(
+                                    "tool_result image source 缺少 media_type 或 data，跳过: type={:?} keys={:?}",
+                                    source.get("type"),
+                                    source.as_object().map(|o| o.keys().collect::<Vec<_>>())
+                                );
                             }
                         }
                     }
